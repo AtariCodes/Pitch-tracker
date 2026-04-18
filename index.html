@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Voice Pitch Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tonaljs/tonal/browser/tonal.min.js"></script>
+    <style>
+        :root {
+            --bg: #121212;
+            --white: #ffffff;
+            --black: #2c2c2c;
+            --highlight: #e74c3c; /* Red */
+            --in-scale: #34495e; /* Muted Blue */
+        }
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg); color: white; text-align: center; margin: 0; padding: 10px; 
+            overflow-x: hidden;
+        }
+
+        .header { padding: 20px; }
+        #note-display { font-size: 5rem; font-weight: bold; color: #2ecc71; height: 100px; margin-bottom: 10px; }
+        
+        .controls { margin-bottom: 20px; background: #1e1e1e; padding: 15px; border-radius: 10px; display: inline-block; }
+        select { padding: 10px; border-radius: 5px; background: #333; color: white; border: 1px solid #555; font-size: 16px; }
+        
+        #startBtn { 
+            padding: 10px 20px; background: #2ecc71; border: none; color: white; 
+            font-weight: bold; border-radius: 5px; cursor: pointer; margin-left: 5px;
+        }
+
+        /* Keyboard Layout */
+        #keyboard { 
+            display: flex; justify-content: flex-start; position: relative; 
+            height: 250px; margin: 0 auto; overflow-x: auto; padding: 20px;
+            max-width: 100vw; -webkit-overflow-scrolling: touch;
+        }
+
+        .key { 
+            position: relative; border: 1px solid #000; height: 100%; width: 50px; 
+            background: var(--white); color: #888; display: flex; align-items: flex-end; 
+            justify-content: center; padding-bottom: 10px; flex-shrink: 0; 
+            border-radius: 0 0 5px 5px; font-size: 12px; z-index: 1; box-sizing: border-box;
+        }
+
+        .key.black { 
+            background: var(--black); color: #eee; height: 60%; width: 34px; 
+            margin-left: -17px; margin-right: -17px; z-index: 2; border-radius: 0 0 3px 3px; 
+        }
+
+        /* Highlighting Logic */
+        .key.in-scale { background: var(--in-scale); color: white; }
+        .key.black.in-scale { background: #243447; }
+
+        /* THE FIX: High specificity for active notes */
+        .key.active, .key.black.active { 
+            background-color: var(--highlight) !important; 
+            background-image: none !important;
+            color: white !important;
+            z-index: 3;
+            transform: translateY(2px);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div id="note-display">--</div>
+        <div class="controls">
+            <select id="keySelect">
+                <option value="none">No Scale</option>
+                <option value="C major">C Major</option>
+                <option value="D major">D Major</option>
+                <option value="E major">E Major</option>
+                <option value="F major">F Major</option>
+                <option value="G major">G Major</option>
+                <option value="A major">A Major</option>
+                <option value="B major">B Major</option>
+                <option value="A minor">A Minor</option>
+                <option value="E minor">E Minor</option>
+            </select>
+            <button id="startBtn">Start Mic</button>
+        </div>
+    </div>
+
+    <div id="keyboard"></div>
+
+    <script>
+        const notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        const keyboard = document.getElementById('keyboard');
+        const noteDisplay = document.getElementById('note-display');
+        const keySelect = document.getElementById('keySelect');
+        const startBtn = document.getElementById('startBtn');
+        
+        let audioCtx, analyser, dataArray;
+        let isRunning = false;
+
+        // 1. Build Keyboard (Octaves 3 and 4)
+        for (let oct = 3; oct <= 4; oct++) {
+            notes.forEach(note => {
+                const key = document.createElement('div');
+                const isSharp = note.includes('#');
+                key.className = `key ${isSharp ? 'black' : 'white'}`;
+                key.dataset.note = `${note}${oct}`;
+                key.innerHTML = `<span>${note}${oct}</span>`;
+                keyboard.appendChild(key);
+            });
+        }
+
+        // 2. Scale Selection Logic
+        keySelect.addEventListener('change', () => {
+            const selected = keySelect.value;
+            const scaleNotes = selected !== "none" ? Tonal.Scale.get(selected).notes : [];
+            document.querySelectorAll('.key').forEach(key => {
+                const noteName = key.dataset.note.replace(/[0-9]/g, '');
+                const isInScale = scaleNotes.some(sn => Tonal.Note.chroma(sn) === Tonal.Note.chroma(noteName));
+                key.classList.toggle('in-scale', isInScale);
+            });
+        });
+
+        // 3. Audio & Pitch Engine
+        async function startAudio() {
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { echoCancellation: false, noiseSuppression: false } 
+                });
+
+                const source = audioCtx.createMediaStreamSource(stream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 2048;
+                source.connect(analyser);
+                dataArray = new Float32Array(analyser.fftSize);
+                
+                startBtn.innerText = "Listening...";
+                startBtn.style.background = "#555";
+                updateLoop();
+            } catch (err) {
+                alert("Please allow microphone access.");
+            }
+        }
+
+        function updateLoop() {
+            analyser.getFloatTimeDomainData(dataArray);
+            const freq = autoCorrelate(dataArray, audioCtx.sampleRate);
+            
+            if (freq !== -1) {
+                const noteName = Tonal.Note.fromFreq(freq);
+                if (noteName) {
+                    const simplified = Tonal.Note.simplify(noteName);
+                    noteDisplay.innerText = simplified;
+                    highlightKey(simplified);
+                }
+            }
+            requestAnimationFrame(updateLoop);
+        }
+
+        function highlightKey(currentNote) {
+            const allKeys = document.querySelectorAll('.key');
+            allKeys.forEach(k => {
+                const keyNote = k.dataset.note;
+                // Match by chroma (C# == Db) and Octave
+                const isMatch = (Tonal.Note.chroma(keyNote) === Tonal.Note.chroma(currentNote)) && 
+                                (Tonal.Note.octave(keyNote) === Tonal.Note.octave(currentNote));
+                k.classList.toggle('active', isMatch);
+            });
+        }
+
+        // 4. Math: Autocorrelation (Pitch Detection)
+        function autoCorrelate(buf, sampleRate) {
+            let SIZE = buf.length;
+            let rms = 0;
+            for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
+            if (Math.sqrt(rms / SIZE) < 0.01) return -1; // Volume Gate
+
+            let r1 = 0, r2 = SIZE - 1, threshold = 0.2;
+            for (let i = 0; i < SIZE / 2; i++) if (Math.abs(buf[i]) < threshold) { r1 = i; break; }
+            for (let i = 1; i < SIZE / 2; i++) if (Math.abs(buf[SIZE - i]) < threshold) { r2 = SIZE - i; break; }
+            buf = buf.slice(r1, r2);
+            SIZE = buf.length;
+
+            let c = new Array(SIZE).fill(0);
+            for (let i = 0; i < SIZE; i++)
+                for (let j = 0; j < SIZE - i; j++) c[i] = c[i] + buf[j] * buf[j + i];
+
+            let d = 0; while (c[d] > c[d + 1]) d++;
+            let maxval = -1, maxpos = -1;
+            for (let i = d; i < SIZE; i++) {
+                if (c[i] > maxval) { maxval = c[i]; maxpos = i; }
+            }
+            return sampleRate / maxpos;
+        }
+
+        startBtn.addEventListener('click', () => {
+            if (!isRunning) {
+                startAudio();
+                isRunning = true;
+            }
+        });
+    </script>
+</body>
+</html>
+
+.
